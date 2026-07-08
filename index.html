@@ -60,8 +60,17 @@
 
         if (firebaseConfigStr) {
             try {
-                const firebaseConfig = JSON.parse(firebaseConfigStr);
-                const app = initializeApp(firebaseConfig);
+              const firebaseConfig = {
+  apiKey: "AIzaSyAwdRrIdL3lJsrISTQcDPy7SeQGJdSiJOA",
+  authDomain: "lunchbreak-872cd.firebaseapp.com",
+  projectId: "lunchbreak-872cd",
+  storageBucket: "lunchbreak-872cd.firebasestorage.app",
+  messagingSenderId: "816613106451",
+  appId: "1:816613106451:web:6225f0fa396b6b9f1170e6"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
                 auth = getAuth(app);
                 db = getFirestore(app);
                 initAuth();
