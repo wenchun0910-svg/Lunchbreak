@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>學生午休作息記錄表 (和風)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, getDoc, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Tailwind 設定 (日式和風色彩保留基礎)
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'wabi-bg': '#fdfbf7',     // 米白紙色
+                        'wabi-text': '#4a4a4a',   // 深灰墨色
+                        'nippon-gray': '#d4c9b9',  // 胡桃/灰棕 (未指派)
+                        'nippon-dark': '#2c3e50',  // 藏青
+                    }
+                }
+            }
+        }
+
+        // --- 預設日系色票 (供新增事由時選擇) ---
+        const colorPalette = [
+            { hex: '#86a397', name: '抹茶綠' },
+            { hex: '#e3a063', name: '薄香 (橘)' },
+            { hex: '#9c8bbd', name: '藤色 (紫)' },
+            { hex: '#2a5caa', name: '琉璃青 (藍)' },
+            { hex: '#9d2933', name: '臙脂 (紅)' },
+            { hex: '#c88400', name: '琥珀 (黃)' },
+            { hex: '#6b7b8c', name: '藍鼠 (灰藍)' }
+        ];
+
+        // --- 全域應用程式狀態 ---
+        let settings = {
+            title: "學生午休作息記錄表",
+            reasons: [
+                { id: 'leave', name: '公假', hex: '#86a397' },
+                { id: 'pad40', name: '借平板 40 分鐘', hex: '#e3a063' },
+                { id: 'pad20', name: '借平板 20 分鐘', hex: '#9c8bbd' }
+            ]
+        };
+
+        // 動態產生的 ZONES 對照表
+        let ZONES = {};
+        
+        let studentCount = parseInt(localStorage.getItem('studentCount')) || 0;
+        let studentStatus = {}; // { 1: 'unassigned', 2: 'leave', ... }
+        let allHistoryData = [];
+
+        // Firebase 基礎設定
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'lunch-record-app';
+        const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+        let db, auth, currentUser = null;
+
+        if (firebaseConfigStr) {
+            try {
+                const firebaseConfig = JSON.parse(firebaseConfigStr);
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                initAuth();
+            } catch (e) {
+                console.error("Firebase 初始化失敗:", e);
+                showToast("資料庫連線異常");
+            }
+        } else {
+            console.warn("未提供 Firebase 設定，將以本地模式運行");
+            applySettingsToUI(); // 本地模式直接套用預設設定
+        }
+
+        async function initAuth() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+                onAuthStateChanged(auth, async (user) => {
+                    currentUser = user;
+                    if (user) {
+                        await loadSettings();
+                        loadHistoryData(); 
+                    }
+                });
+            } catch (error) {
+                console.error("驗證失敗:", error);
+                applySettingsToUI();
+            }
+        }
+
+        // 初始化畫面與事件綁定
+        document.addEventListener('DOMContentLoaded', () => {
+            const countInput = document.getElementById('student-count-input');
+            if (studentCount > 0) {
+                countInput.value = studentCount;
+                // initStudents 會在 applySettingsToUI 後呼叫以確保區塊已產生
+            }
+
+            // 按鈕事件綁定
+            document.getElementById('btn-set-count').addEventListener('click', () => {
+                const count = parseInt(countInput.value);
+                if (count > 0 && count <= 100) {
+                    studentCount = count;
+                    localStorage.setItem('studentCount', count);
+                    initStudents(count);
+                    showToast("人數設定完成，學生列表已更新。");
+                } else {
+                    showToast("請輸入有效的學生人數 (1-100)。");
+                }
+            });
+
+            document.getElementById('btn-reset').addEventListener('click', resetAllStatus);
+            document.getElementById('btn-finish').addEventListener('click', handleFinishRecord);
+            document.getElementById('btn-close-modal').addEventListener('click', () => toggleModal('summary-modal', false));
+            
+            // 查詢 Modal
+            document.getElementById('btn-query-open').addEventListener('click', () => {
+                toggleModal('query-modal', true);
+                if(currentUser) loadHistoryData();
+            });
+            document.getElementById('btn-close-query').addEventListener('click', () => toggleModal('query-modal', false));
+            document.getElementById('btn-do-query').addEventListener('click', doQuery);
+
+            // 設定 Modal
+            document.getElementById('btn-settings-open').addEventListener('click', openSettingsModal);
+            document.getElementById('btn-close-settings').addEventListener('click', () => toggleModal('settings-modal', false));
+            document.getElementById('btn-save-settings').addEventListener('click', saveSettingsToFirebase);
+            document.getElementById('btn-add-reason').addEventListener('click', addNewReason);
+            
+            initColorPicker();
+        });
+
+        // --- 設定管理 (CRUD) ---
+
+        async function loadSettings() {
+            if (!currentUser || !db) return;
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'settings', 'config');
+                const docSnap = await getDoc(docRef);
+                if (docSnap.exists()) {
+                    settings = docSnap.data();
+                }
+            } catch (error) {
+                console.error("讀取設定失敗:", error);
+            }
+            applySettingsToUI();
+        }
+
+        async function saveSettingsToFirebase() {
+            // 更新標題
+            const newTitle = document.getElementById('setting-app-title').value.trim();
+            if (newTitle) settings.title = newTitle;
+
+            if (currentUser && db) {
+                try {
+                    const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'settings', 'config');
+                    await setDoc(docRef, settings);
+                    showToast("設定已儲存");
+                } catch (error) {
+                    console.error("儲存設定失敗:", error);
+                    showToast("儲存設定失敗");
+                }
+            }
+            
+            toggleModal('settings-modal', false);
+            applySettingsToUI();
+        }
+
+        // 將設定套用到畫面 (標題與右側區塊)
+        function applySettingsToUI() {
+            // 更新標題
+            document.getElementById('app-main-title').textContent = settings.title;
+            document.title = settings.title;
+
+            // 重建 ZONES 對照表
+            ZONES = {
+                'unassigned': { id: 'zone-unassigned', name: '未指派 / 教室', hex: '' }
+            };
+            settings.reasons.forEach(r => {
+                ZONES[r.id] = { id: `zone-${r.id}`, name: r.name, hex: r.hex };
+            });
+
+            // 動態產生右側拖曳區塊
+            const container = document.getElementById('special-zones-container');
+            container.innerHTML = '';
+            
+            settings.reasons.forEach(r => {
+                const zoneDiv = document.createElement('div');
+                zoneDiv.id = `zone-${r.id}`;
+                zoneDiv.className = 'drop-zone flex-1 bg-white border-l-8 rounded-lg shadow-sm p-3 md:p-4 flex flex-col transition-all duration-300 min-h-[120px]';
+                zoneDiv.style.borderLeftColor = r.hex;
+                
+                zoneDiv.innerHTML = `
+                    <h2 class="font-bold mb-2 flex items-center gap-2" style="color: ${r.hex};">
+                        <span class="w-3 h-3 rounded-full" style="background-color: ${r.hex};"></span> ${r.name}
+                    </h2>
+                    <div class="student-container flex-1 flex flex-wrap content-start gap-2 md:gap-3 overflow-y-auto"></div>
+                `;
+                container.appendChild(zoneDiv);
+            });
+
+            // 確保不在設定事由內的學生回到 unassigned
+            for (let i = 1; i <= studentCount; i++) {
+                if (studentStatus[i] && studentStatus[i] !== 'unassigned' && !ZONES[studentStatus[i]]) {
+                    studentStatus[i] = 'unassigned';
+                }
+            }
+
+            setupDragAndDropZones(); // 重新綁定事件
+            
+            // 畫面重繪學生按鈕
+            if (studentCount > 0) {
+                if (Object.keys(studentStatus).length === 0) {
+                    initStudents(studentCount);
+                } else {
+                    renderAllZones();
+                }
+            }
+        }
+
+        // 開啟設定面板並填入現有資料
+        function openSettingsModal() {
+            document.getElementById('setting-app-title').value = settings.title;
+            renderSettingsReasons();
+            toggleModal('settings-modal', true);
+        }
+
+        // 渲染設定面板中的事由清單
+        function renderSettingsReasons() {
+            const list = document.getElementById('settings-reason-list');
+            list.innerHTML = '';
+            settings.reasons.forEach((r, index) => {
+                const li = document.createElement('div');
+                li.className = 'flex justify-between items-center bg-gray-50 p-2 rounded border border-gray-200';
+                li.innerHTML = `
+                    <div class="flex items-center gap-2">
+                        <div class="w-4 h-4 rounded-full" style="background-color: ${r.hex};"></div>
+                        <span class="text-gray-700">${r.name}</span>
+                    </div>
+                    <button class="text-red-400 hover:text-red-600 p-1" onclick="deleteReason(${index})">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                    </button>
+                `;
+                list.appendChild(li);
+            });
+        }
+
+        // 供設定面板呼叫的刪除功能 (需設為 global function 因為 onclick 字串呼叫)
+        window.deleteReason = function(index) {
+            if(confirm('確定要刪除這項事由嗎？')) {
+                settings.reasons.splice(index, 1);
+                renderSettingsReasons();
+            }
+        }
+
+        let selectedColorHex = colorPalette[0].hex;
+        
+        function initColorPicker() {
+            const container = document.getElementById('color-picker');
+            container.innerHTML = '';
+            colorPalette.forEach((c, idx) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = `w-8 h-8 rounded-full focus:outline-none transition-transform ${idx === 0 ? 'ring-2 ring-offset-2 ring-gray-400 scale-110' : 'hover:scale-110'}`;
+                btn.style.backgroundColor = c.hex;
+                btn.title = c.name;
+                btn.onclick = () => {
+                    // Reset all rings
+                    Array.from(container.children).forEach(child => {
+                        child.classList.remove('ring-2', 'ring-offset-2', 'ring-gray-400', 'scale-110');
+                    });
+                    btn.classList.add('ring-2', 'ring-offset-2', 'ring-gray-400', 'scale-110');
+                    selectedColorHex = c.hex;
+                };
+                container.appendChild(btn);
+            });
+        }
+
+        function addNewReason() {
+            const nameInput = document.getElementById('new-reason-name');
+            const name = nameInput.value.trim();
+            if (!name) {
+                showToast('請輸入事由名稱');
+                return;
+            }
+            const newId = 'reason_' + Date.now();
+            settings.reasons.push({ id: newId, name: name, hex: selectedColorHex });
+            nameInput.value = ''; // 清空輸入框
+            renderSettingsReasons();
+        }
+
+
+        // --- 核心應用程式邏輯 ---
+
+        function initStudents(count) {
+            studentStatus = {};
+            for (let i = 1; i <= count; i++) {
+                studentStatus[i] = 'unassigned';
+            }
+            renderAllZones();
+        }
+
+        function renderAllZones() {
+            // 清空所有區塊
+            Object.values(ZONES).forEach(zone => {
+                const container = document.getElementById(zone.id)?.querySelector('.student-container');
+                if (container) container.innerHTML = '';
+            });
+
+            // 將學生放入對應區塊
+            for (let i = 1; i <= studentCount; i++) {
+                let status = studentStatus[i] || 'unassigned';
+                // 防呆：如果狀態已經不存在，設回 unassigned
+                if (!ZONES[status]) {
+                    status = 'unassigned';
+                    studentStatus[i] = status;
+                }
+                const zoneInfo = ZONES[status];
+                const container = document.getElementById(zoneInfo.id)?.querySelector('.student-container');
+                
+                if (container) {
+                    const btn = createStudentButton(i, status);
+                    container.appendChild(btn);
+                }
+            }
+        }
+
+        function createStudentButton(number, status) {
+            const btn = document.createElement('div');
+            
+            btn.className = `student-btn w-12 h-12 rounded-full flex items-center justify-center font-bold text-lg cursor-pointer shadow-sm transition-all duration-200 select-none`;
+            btn.textContent = number;
+            btn.dataset.number = number;
+            btn.draggable = true;
+            btn.id = `student-${number}`;
+
+            if (status === 'unassigned') {
+                btn.classList.add('bg-nippon-gray', 'text-wabi-text', 'hover:bg-opacity-80');
+            } else {
+                btn.classList.add('text-white', 'hover:bg-opacity-90');
+                btn.style.backgroundColor = ZONES[status].hex;
+            }
+
+            // 滑鼠與觸控事件
+            btn.addEventListener('dragstart', handleDragStart);
+            btn.addEventListener('dragend', handleDragEnd);
+            btn.addEventListener('touchstart', handleTouchStart, { passive: false });
+            btn.addEventListener('touchmove', handleTouchMove, { passive: false });
+            btn.addEventListener('touchend', handleTouchEnd);
+
+            return btn;
+        }
+
+        // --- 拖曳功能實作 ---
+
+        let draggedStudentNum = null;
+        let ghostEl = null;
+
+        function handleDragStart(e) {
+            draggedStudentNum = e.target.dataset.number;
+            e.dataTransfer.setData('text/plain', draggedStudentNum);
+            setTimeout(() => e.target.classList.add('opacity-50'), 0);
+        }
+
+        function handleDragEnd(e) {
+            e.target.classList.remove('opacity-50');
+            renderAllZones(); 
+        }
+
+        function setupDragAndDropZones() {
+            Object.keys(ZONES).forEach(zoneKey => {
+                const zoneId = ZONES[zoneKey].id;
+                const zoneEl = document.getElementById(zoneId);
+                if (!zoneEl) return;
+                
+                // 移除舊的 event listener 防止重複綁定 (透過 cloneNode 快速清除)
+                const newZoneEl = zoneEl.cloneNode(true);
+                zoneEl.parentNode.replaceChild(newZoneEl, zoneEl);
+                
+                newZoneEl.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    newZoneEl.classList.add('ring-2', 'ring-nippon-dark', 'ring-opacity-50');
+                });
+
+                newZoneEl.addEventListener('dragleave', () => {
+                    newZoneEl.classList.remove('ring-2', 'ring-nippon-dark', 'ring-opacity-50');
+                });
+
+                newZoneEl.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    newZoneEl.classList.remove('ring-2', 'ring-nippon-dark', 'ring-opacity-50');
+                    const num = e.dataTransfer.getData('text/plain');
+                    if (num) updateStudentStatus(num, zoneKey);
+                });
+            });
+        }
+
+        // 觸控拖曳邏輯
+        function handleTouchStart(e) {
+            draggedStudentNum = e.target.dataset.number;
+            const touch = e.touches[0];
+            
+            ghostEl = e.target.cloneNode(true);
+            ghostEl.classList.add('fixed', 'pointer-events-none', 'z-50', 'opacity-80', 'scale-110');
+            ghostEl.style.left = (touch.clientX - 24) + 'px'; 
+            ghostEl.style.top = (touch.clientY - 24) + 'px';
+            document.body.appendChild(ghostEl);
+            
+            e.target.classList.add('opacity-30');
+        }
+
+        function handleTouchMove(e) {
+            if (!ghostEl) return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            ghostEl.style.left = (touch.clientX - 24) + 'px';
+            ghostEl.style.top = (touch.clientY - 24) + 'px';
+        }
+
+        function handleTouchEnd(e) {
+            if (!ghostEl) return;
+            const touch = e.changedTouches[0];
+            
+            ghostEl.style.display = 'none'; 
+            const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
+            document.body.removeChild(ghostEl);
+            ghostEl = null;
+
+            if (targetEl) {
+                const dropZone = targetEl.closest('.drop-zone');
+                if (dropZone) {
+                    const targetZoneId = dropZone.id;
+                    const zoneKey = Object.keys(ZONES).find(key => ZONES[key].id === targetZoneId);
+                    if (zoneKey && draggedStudentNum) {
+                        updateStudentStatus(draggedStudentNum, zoneKey);
+                    }
+                }
+            }
+            draggedStudentNum = null;
+            renderAllZones();
+        }
+
+        function updateStudentStatus(num, newStatus) {
+            studentStatus[num] = newStatus;
+            renderAllZones();
+        }
+
+        function resetAllStatus() {
+            if(confirm('確定要將所有學生的狀態重置為「未指派」嗎？')) {
+                for (let i = 1; i <= studentCount; i++) {
+                    studentStatus[i] = 'unassigned';
+                }
+                renderAllZones();
+                showToast("已重置所有狀態。");
+            }
+        }
+
+        // --- Firebase 儲存與記錄結束 ---
+
+        async function handleFinishRecord() {
+            if (studentCount === 0) {
+                showToast("請先設定學生人數");
+                return;
+            }
+
+            // 統計資料
+            const summary = {};
+            Object.keys(ZONES).forEach(key => summary[key] = []);
+            
+            for (let i = 1; i <= studentCount; i++) {
+                const status = studentStatus[i] || 'unassigned';
+                if(summary[status]) summary[status].push(i);
+            }
+
+            // 準備顯示在 Modal
+            let htmlContent = `<div class="space-y-4">`;
+            Object.keys(ZONES).forEach(key => {
+                const count = summary[key].length;
+                const numbers = summary[key].join(', ') || '無';
+                const zone = ZONES[key];
+                const colorVal = key === 'unassigned' ? '#d4c9b9' : zone.hex;
+                
+                htmlContent += `
+                    <div class="bg-gray-50 p-3 rounded-lg border border-gray-200">
+                        <div class="font-bold flex justify-between" style="color: ${key === 'unassigned' ? '#4a4a4a' : colorVal};">
+                            <span>${zone.name}</span>
+                            <span class="bg-gray-200 text-gray-700 px-2 rounded-full text-sm">${count} 人</span>
+                        </div>
+                        <div class="mt-1 text-gray-600 text-sm break-words">${numbers}</div>
+                    </div>
+                `;
+            });
+            htmlContent += `</div>`;
+            
+            document.getElementById('summary-content').innerHTML = htmlContent;
+            
+            // 儲存至 Firebase (記錄當下的區塊名稱避免未來改名破版)
+            if (currentUser && db) {
+                const todayStr = new Date().toISOString().split('T')[0]; 
+                
+                // 產生名稱快照
+                const snapshotNames = {};
+                Object.keys(ZONES).forEach(k => snapshotNames[k] = ZONES[k].name);
+
+                const dataToSave = {
+                    date: todayStr,
+                    timestamp: new Date().getTime(),
+                    count: studentCount,
+                    records: studentStatus,
+                    zoneNamesSnapshot: snapshotNames
+                };
+
+                try {
+                    document.getElementById('summary-saving-msg').classList.remove('hidden');
+                    const collectionRef = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'lunch_records');
+                    await setDoc(doc(collectionRef, todayStr), dataToSave);
+                    document.getElementById('summary-saving-msg').innerHTML = '<span class="text-green-600">✓ 紀錄已成功儲存至雲端</span>';
+                    loadHistoryData(); 
+                } catch (error) {
+                    console.error("儲存失敗:", error);
+                    document.getElementById('summary-saving-msg').innerHTML = '<span class="text-red-500">儲存失敗，請檢查網路連線。</span>';
+                }
+            } else {
+                document.getElementById('summary-saving-msg').innerHTML = '<span class="text-yellow-600">未連線至資料庫，僅顯示本地結果。</span>';
+                document.getElementById('summary-saving-msg').classList.remove('hidden');
+            }
+
+            toggleModal('summary-modal', true);
+        }
+
+        // --- 查詢功能 ---
+
+        async function loadHistoryData() {
+            if (!currentUser || !db) return;
+            try {
+                const collectionRef = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'lunch_records');
+                const querySnapshot = await getDocs(collectionRef);
+                allHistoryData = [];
+                querySnapshot.forEach((doc) => {
+                    allHistoryData.push({ id: doc.id, ...doc.data() });
+                });
+                allHistoryData.sort((a, b) => b.timestamp - a.timestamp);
+            } catch (error) {
+                console.error("讀取歷史資料失敗:", error);
+            }
+        }
+
+        function doQuery() {
+            const numQuery = document.getElementById('query-number').value;
+            const dateStart = document.getElementById('query-date-start').value;
+            const dateEnd = document.getElementById('query-date-end').value;
+            const resultsContainer = document.getElementById('query-results');
+
+            if (allHistoryData.length === 0) {
+                resultsContainer.innerHTML = '<p class="text-gray-500 text-center py-4">尚無雲端記錄可供查詢。</p>';
+                return;
+            }
+
+            let filteredData = allHistoryData;
+            if (dateStart) filteredData = filteredData.filter(d => d.date >= dateStart);
+            if (dateEnd) filteredData = filteredData.filter(d => d.date <= dateEnd);
+
+            if (filteredData.length === 0) {
+                resultsContainer.innerHTML = '<p class="text-gray-500 text-center py-4">該區間無相關記錄。</p>';
+                return;
+            }
+
+            let html = '<div class="space-y-4 overflow-y-auto max-h-96">';
+            
+            filteredData.forEach(day => {
+                let dayHasData = false;
+                let dayContent = `
+                    <div class="border border-nippon-gray rounded-lg p-3 bg-white shadow-sm">
+                        <div class="font-bold border-b pb-2 mb-2 text-nippon-dark">日期: ${day.date}</div>
+                        <div class="grid grid-cols-2 gap-2 text-sm">
+                `;
+                
+                // 容錯取得當下名稱 (支援舊版沒有快照的資料)
+                const getName = (statusKey) => {
+                    if (day.zoneNamesSnapshot && day.zoneNamesSnapshot[statusKey]) return day.zoneNamesSnapshot[statusKey];
+                    if (ZONES[statusKey]) return ZONES[statusKey].name;
+                    return `已刪除事由 (${statusKey})`;
+                };
+
+                if (numQuery && numQuery.trim() !== "") {
+                    const n = numQuery.trim();
+                    const status = day.records[n];
+                    if (status) {
+                        dayContent += `
+                            <div class="col-span-2 flex items-center gap-2">
+                                <span class="bg-gray-100 px-2 py-1 rounded">座號 ${n}</span>
+                                <span class="font-medium">${getName(status)}</span>
+                            </div>`;
+                        dayHasData = true;
+                    } else {
+                         dayContent += `<div class="col-span-2 text-gray-400">座號 ${n} 查無資料</div>`;
+                         dayHasData = true; 
+                    }
+                } else {
+                    let specials = [];
+                    Object.keys(day.records).forEach(num => {
+                        const status = day.records[num];
+                        if (status !== 'unassigned') specials.push(`座號 ${num} (${getName(status)})`);
+                    });
+                    
+                    if (specials.length > 0) {
+                        dayContent += `<div class="col-span-2 text-gray-700 leading-relaxed">${specials.join('、 ')}</div>`;
+                    } else {
+                        dayContent += `<div class="col-span-2 text-gray-500 italic">全班皆未指派特殊作息</div>`;
+                    }
+                    dayHasData = true;
+                }
+
+                dayContent += `</div></div>`;
+                if(dayHasData) html += dayContent;
+            });
+            html += '</div>';
+            resultsContainer.innerHTML = html;
+        }
+
+        // --- 輔助工具 ---
+
+        function toggleModal(modalId, show) {
+            const modal = document.getElementById(modalId);
+            if (show) {
+                modal.classList.remove('hidden');
+                modal.classList.add('flex');
+            } else {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }
+        }
+
+        function showToast(msg) {
+            const toast = document.createElement('div');
+            toast.className = 'fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white px-4 py-2 rounded-full shadow-lg z-50 transition-opacity duration-300';
+            toast.textContent = msg;
+            document.body.appendChild(toast);
+            setTimeout(() => {
+                toast.classList.add('opacity-0');
+                setTimeout(() => document.body.removeChild(toast), 300);
+            }, 2500);
+        }
+
+    </script>
+    <style>
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #d4c9b9; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #bba993; }
+        .student-container { min-height: 100px; }
+        body { user-select: none; -webkit-user-select: none; }
+    </style>
+</head>
+<body class="bg-wabi-bg text-wabi-text min-h-screen font-sans pb-16">
+
+    <!-- 頂部導覽 -->
+    <header class="bg-white border-b-2 border-nippon-gray px-4 py-3 sticky top-0 z-10 shadow-sm flex justify-between items-center">
+        <div class="flex items-center gap-2">
+            <span class="text-2xl font-serif" style="color: #86a397;">❖</span>
+            <h1 id="app-main-title" class="text-xl md:text-2xl font-bold tracking-wider">載入中...</h1>
+        </div>
+        <div class="flex gap-2">
+            <button id="btn-settings-open" class="px-2 py-1.5 md:px-3 text-gray-500 hover:text-gray-800 transition-colors" title="網頁與事由設定">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+            </button>
+            <button id="btn-query-open" class="px-3 py-1.5 md:px-4 md:py-2 text-sm md:text-base border border-nippon-gray rounded-md hover:bg-gray-50 transition-colors text-gray-600 flex items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 inline-block md:mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                <span class="hidden md:inline">作息查詢</span>
+            </button>
+            <button id="btn-finish" class="px-3 py-1.5 md:px-4 md:py-2 text-sm md:text-base bg-nippon-dark text-white rounded-md hover:bg-opacity-90 shadow-sm transition-colors">
+                結束記錄
+            </button>
+        </div>
+    </header>
+
+    <main class="container mx-auto px-4 py-6 max-w-6xl">
+        
+        <!-- 人數設定區 -->
+        <section class="mb-6 bg-white p-4 rounded-lg shadow-sm border border-gray-100 flex flex-wrap items-center gap-4">
+            <label for="student-count-input" class="font-medium text-gray-700">學生總人數：</label>
+            <input type="number" id="student-count-input" min="1" max="100" class="border border-gray-300 rounded-md px-3 py-1.5 w-24 focus:outline-none focus:ring-2 focus:ring-nippon-dark bg-gray-50 text-center" placeholder="輸入人數">
+            <button id="btn-set-count" class="px-4 py-1.5 bg-nippon-gray text-wabi-text font-medium rounded-md hover:bg-opacity-80 transition-colors">
+                產生號碼牌
+            </button>
+            <span class="text-xs text-gray-400 ml-auto hidden md:inline">提示：支援滑鼠或手指直接拖曳號碼牌至下方區塊</span>
+        </section>
+
+        <!-- 記錄區塊 (Grid Layout) -->
+        <div class="grid grid-cols-1 md:grid-cols-12 gap-6 relative">
+            
+            <!-- 左側：未指派區 -->
+            <div class="md:col-span-5 flex flex-col h-[60vh] md:h-[70vh]">
+                <div id="zone-unassigned" class="drop-zone flex-1 bg-white border-2 border-dashed border-gray-300 rounded-xl p-4 flex flex-col transition-all duration-300 overflow-hidden relative">
+                    <h2 class="text-lg font-bold mb-3 pb-2 border-b border-gray-100 text-gray-500 sticky top-0 bg-white z-10">
+                        待分配區 / 教室午休
+                    </h2>
+                    <div class="student-container flex-1 flex flex-wrap content-start gap-3 overflow-y-auto pb-4">
+                        <div class="text-gray-400 w-full text-center mt-10 italic text-sm empty-hint">請先於上方設定人數</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右側：特殊作息區 (動態生成) -->
+            <div id="special-zones-container" class="md:col-span-7 flex flex-col gap-4 h-[60vh] md:h-[70vh] overflow-y-auto pr-2 pb-4">
+                <!-- 區塊將透過 applySettingsToUI 動態載入這裡 -->
+            </div>
+        </div>
+    </main>
+
+    <!-- 底部功能區 -->
+    <footer class="fixed bottom-0 w-full bg-white border-t border-gray-200 p-3 z-10 flex justify-end px-4 md:px-8">
+        <button id="btn-reset" class="flex items-center gap-1 text-red-500 hover:text-red-700 hover:bg-red-50 px-4 py-2 rounded-md transition-colors text-sm font-medium">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            重置今日面板
+        </button>
+    </footer>
+
+    <!-- Modal: 設定面板 (標題與事由) -->
+    <div id="settings-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50 p-4">
+        <div class="bg-wabi-bg rounded-xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+            <div class="bg-nippon-dark text-white px-6 py-4 flex justify-between items-center border-b">
+                <h3 class="text-lg font-bold flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>系統設定
+                </h3>
+                <button id="btn-close-settings" class="text-gray-300 hover:text-white text-xl font-bold">&times;</button>
+            </div>
+            
+            <div class="p-4 md:p-6 bg-white flex-1 overflow-y-auto space-y-6">
+                <!-- 標題設定 -->
+                <div>
+                    <label class="block text-sm font-bold text-gray-700 mb-2">主標題名稱</label>
+                    <input type="text" id="setting-app-title" class="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-nippon-dark" placeholder="例如: 某某班級作息記錄">
+                </div>
+
+                <hr>
+
+                <!-- 事由設定 -->
+                <div>
+                    <label class="block text-sm font-bold text-gray-700 mb-2">午休事由管理</label>
+                    
+                    <!-- 列表 -->
+                    <div id="settings-reason-list" class="space-y-2 mb-4">
+                        <!-- js 動態產生 -->
+                    </div>
+
+                    <!-- 新增區域 -->
+                    <div class="bg-gray-50 border border-gray-200 rounded-lg p-3">
+                        <p class="text-xs text-gray-500 font-medium mb-2">新增事由</p>
+                        <input type="text" id="new-reason-name" class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm mb-3 focus:outline-none focus:ring-1 focus:ring-nippon-dark" placeholder="請輸入新事由名稱 (例: 圖書館)">
+                        <div class="mb-3">
+                            <p class="text-xs text-gray-500 mb-1">選擇代表顏色</p>
+                            <div id="color-picker" class="flex flex-wrap gap-2">
+                                <!-- 色碼選項 js 產生 -->
+                            </div>
+                        </div>
+                        <button id="btn-add-reason" class="w-full bg-white border border-gray-300 text-gray-700 text-sm py-1.5 rounded hover:bg-gray-100 transition-colors font-medium">
+                            + 增加此事由
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 儲存按鈕 -->
+            <div class="p-4 bg-gray-50 border-t flex justify-end">
+                <button id="btn-save-settings" class="bg-nippon-dark text-white px-6 py-2 rounded-md hover:bg-opacity-90 font-medium transition-colors">
+                    儲存設定
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: 結束記錄總結 -->
+    <div id="summary-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50 p-4">
+        <div class="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden transform transition-all">
+            <div class="bg-nippon-dark text-white px-6 py-4 flex justify-between items-center">
+                <h3 class="text-lg font-bold">今日作息總結</h3>
+            </div>
+            <div class="p-6">
+                <div id="summary-content" class="mb-4"></div>
+                <div id="summary-saving-msg" class="text-sm text-center py-2 hidden font-medium"></div>
+                <div class="mt-6 flex justify-center">
+                    <button id="btn-close-modal" class="w-full bg-gray-100 text-gray-700 font-bold py-2 px-4 rounded-lg hover:bg-gray-200 transition-colors border border-gray-300">
+                        確認並關閉
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: 查詢歷史記錄 -->
+    <div id="query-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50 p-4">
+        <div class="bg-wabi-bg rounded-xl shadow-xl w-full max-w-lg overflow-hidden transform transition-all flex flex-col max-h-[90vh]">
+            <div class="bg-nippon-gray text-wabi-text px-6 py-4 flex justify-between items-center border-b">
+                <h3 class="text-lg font-bold flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>作息歷史查詢
+                </h3>
+                <button id="btn-close-query" class="text-gray-500 hover:text-gray-800 text-xl font-bold">&times;</button>
+            </div>
+            
+            <div class="p-4 md:p-6 bg-white flex-1 overflow-y-auto">
+                <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 mb-4 space-y-3">
+                    <div class="flex flex-col sm:flex-row gap-3">
+                        <div class="flex-1">
+                            <label class="block text-sm text-gray-600 mb-1">特定座號 (選填)</label>
+                            <input type="number" id="query-number" class="w-full border border-gray-300 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-nippon-dark" placeholder="例如: 5">
+                        </div>
+                    </div>
+                    <div class="flex flex-col sm:flex-row gap-3">
+                        <div class="flex-1">
+                            <label class="block text-sm text-gray-600 mb-1">開始日期</label>
+                            <input type="date" id="query-date-start" class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-nippon-dark">
+                        </div>
+                        <div class="flex-1">
+                            <label class="block text-sm text-gray-600 mb-1">結束日期</label>
+                            <input type="date" id="query-date-end" class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-nippon-dark">
+                        </div>
+                    </div>
+                    <button id="btn-do-query" class="w-full bg-nippon-dark text-white py-2 rounded-md hover:bg-opacity-90 transition-colors mt-2 text-sm font-medium">
+                        開始查詢
+                    </button>
+                </div>
+                <div id="query-results" class="min-h-[150px]">
+                    <p class="text-gray-400 text-center py-8 text-sm">設定條件後點擊查詢</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
