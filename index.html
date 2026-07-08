@@ -53,13 +53,12 @@
         let studentStatus = {}; // { 1: 'unassigned', 2: 'leave', ... }
         let allHistoryData = [];
 
-        
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'lunch-record-app';
-        const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
-        let db, auth, currentUser = null;
-
       
-               const firebaseConfig = {
+      const appId = 'lunchbreak';
+        let db, auth, currentUser = null;
+        
+        // 貼上 Firebase 給您的設定檔
+      const firebaseConfig = {
   apiKey: "AIzaSyAwdRrIdL3lJsrISTQcDPy7SeQGJdSiJOA",
   authDomain: "lunchbreak-872cd.firebaseapp.com",
   projectId: "lunchbreak-872cd",
@@ -70,19 +69,12 @@
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-                auth = getAuth(app);
-                db = getFirestore(app);
-                initAuth();
-            } catch (e) {
-                console.error("Firebase 初始化失敗:", e);
-                showToast("資料庫連線異常");
-            }
-        } else {
-            console.warn("未提供 Firebase 設定，將以本地模式運行");
-            applySettingsToUI(); // 本地模式直接套用預設設定
-        }
+        auth = getAuth(app);
+        db = getFirestore(app);
+        initAuth();
 
       
+
         async function initAuth() {
             try {
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
